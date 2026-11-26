@@ -39,14 +39,21 @@ jobs:
       - name: Download llama.cpp (Vulkan GPU + CPU builds)
         shell: pwsh
         run: |
-          $tag = $env:LLAMA_TAG
-          if (-not $tag) { $tag = gh release view --repo ggml-org/llama.cpp --json tagName -q .tagName }
-          Write-Host "llama.cpp release: $tag"
-          $assets = gh release view $tag --repo ggml-org/llama.cpp --json assets -q '.assets[].name'
+          # Find the newest release (or the pinned LLAMA_TAG) that ships Windows Vulkan + CPU zips.
+          $rels = gh api "repos/ggml-org/llama.cpp/releases?per_page=40" | ConvertFrom-Json
+          if ($env:LLAMA_TAG) { $rels = $rels | Where-Object { $_.tag_name -eq $env:LLAMA_TAG } }
+          $pick = @{}
+          foreach ($r in $rels) {
+            $names = $r.assets | ForEach-Object { $_.name }
+            $v = $names | Where-Object { $_ -match "win.*vulkan.*x64.*\.zip$" } | Select-Object -First 1
+            $c = $names | Where-Object { $_ -match "win.*cpu.*x64.*\.zip$" } | Select-Object -First 1
+            if ($v -and $c) { $tag = $r.tag_name; $pick = @{ vulkan = $v; cpu = $c }; break }
+          }
+          if (-not $pick.Count) { throw "No llama.cpp release with Windows vulkan+cpu x64 zips found" }
+          Write-Host "llama.cpp release: $tag  ($($pick.vulkan), $($pick.cpu))"
           New-Item -ItemType Directory -Force dl | Out-Null
           foreach ($kind in @("vulkan", "cpu")) {
-            $name = $assets | Where-Object { $_ -match "bin-win-$kind-x64\.zip$" } | Select-Object -First 1
-            if (-not $name) { throw "No win-$kind-x64 asset in $tag. Assets: $assets" }
+            $name = $pick[$kind]
             gh release download $tag --repo ggml-org/llama.cpp --pattern $name --dir dl --clobber
             $dest = "packaging/llama/$kind"
             Expand-Archive "dl/$name" -DestinationPath "dl/$kind" -Force
