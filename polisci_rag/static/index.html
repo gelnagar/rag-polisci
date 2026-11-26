@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PoliSci RAG</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="nav">
+    <div class="brand">PoliSci <span>RAG</span></div>
+    <button data-view="library" class="active">📚 Library</button>
+    <button data-view="chat">💬 Research chat</button>
+    <button data-view="review">📝 Book review</button>
+    <button data-view="compare">⚖️ Compare texts</button>
+    <button data-view="saved">🗂️ Saved work</button>
+    <button data-view="settings">⚙️ Settings</button>
+    <div id="engine" class="engine">Engine: …</div>
+    <div id="jobsbox"></div>
+  </aside>
+
+  <main>
+    <!-- LIBRARY -->
+    <section id="view-library" class="view active">
+      <header><h1>Library</h1><p>Import long PDFs (1,000+ pages is fine). Each is split into chapters, indexed for search, and can be digested chapter by chapter for whole-book analysis.</p></header>
+      <div id="drop" class="drop">
+        <p><b>Drop PDFs here</b> or <label class="linkish">choose files<input id="file" type="file" accept="application/pdf" multiple hidden></label></p>
+        <p class="muted">Text-based PDFs work best. Scanned books need OCR first.</p>
+      </div>
+      <div id="docs"></div>
+      <div id="docdetail" class="card hidden"></div>
+    </section>
+
+    <!-- CHAT -->
+    <section id="view-chat" class="view">
+      <div class="chatwrap">
+        <div class="chatside">
+          <button id="newchat" class="primary small">+ New chat</button>
+          <div id="chatlist"></div>
+        </div>
+        <div class="chatmain">
+          <div class="scope"><span class="muted">Focus on:</span> <span id="chatscope"></span></div>
+          <div id="messages"><div class="empty">Ask anything about your texts — e.g. <i>“How does the author define state capacity, and how does that differ from Fukuyama?”</i> The assistant searches, reads pages and cites them.</div></div>
+          <form id="chatform">
+            <textarea id="chatinput" rows="3" placeholder="Ask a research question… (Enter to send, Shift+Enter for newline)"></textarea>
+            <button class="primary" id="sendbtn">Send</button>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <!-- REVIEW -->
+    <section id="view-review" class="view">
+      <header><h1>Book review</h1><p>Generates a full critical review grounded in the text with page citations. If the book has no digest yet, a fast digest is built first.</p></header>
+      <div class="card form">
+        <label>Book <select id="revdoc"></select></label>
+        <label>Format
+          <select id="revstyle">
+            <option value="journal">Scholarly journal review (APSR / Perspectives style)</option>
+            <option value="seminar">Seminar critical analysis paper</option>
+            <option value="brief">Reading brief + discussion questions</option>
+            <option value="argument_map">Argument map</option>
+          </select></label>
+        <label>Extra instructions (optional)
+          <textarea id="revinstr" rows="3" placeholder="e.g. Focus on the theory of democratic backsliding; engage Levitsky & Ziblatt; assess the case selection."></textarea></label>
+        <button class="primary" id="revgo">Write review</button>
+      </div>
+      <div id="revout" class="doc"></div>
+    </section>
+
+    <!-- COMPARE -->
+    <section id="view-compare" class="view">
+      <header><h1>Compare texts</h1><p>Side-by-side comparative analysis across two or more texts, organised by axes of comparison, with a summary table.</p></header>
+      <div class="card form">
+        <div>Texts <div id="cmpdocs" class="checks"></div></div>
+        <label>Question / focus
+          <textarea id="cmpq" rows="2" placeholder="e.g. How do these authors explain the origins of the modern state?"></textarea></label>
+        <label>Axes of comparison (optional, one per line — leave blank to let the model choose)
+          <textarea id="cmpaxes" rows="3" placeholder="Role of war&#10;Methodology&#10;Normative stance"></textarea></label>
+        <button class="primary" id="cmpgo">Compare</button>
+      </div>
+      <div id="cmpout" class="doc"></div>
+    </section>
+
+    <!-- SAVED -->
+    <section id="view-saved" class="view">
+      <header><h1>Saved work</h1><p>Every review and comparison is saved here. Export to Word with readable citations.</p></header>
+      <div id="outputs"></div>
+      <div id="outview" class="doc"></div>
+    </section>
+
+    <!-- SETTINGS -->
+    <section id="view-settings" class="view">
+      <header><h1>Settings</h1></header>
+      <div class="card form" id="settingsform">
+        <label>Context window (tokens) <input type="number" name="context_size" step="1024" min="4096" max="40960">
+          <small>16384 needs ~8 GB RAM/VRAM total. Raise to 32768 if you have 16 GB+.</small></label>
+        <label>GPU layers <input type="number" name="gpu_layers" min="-1">
+          <small>-1 = auto (use GPU if possible), 0 = CPU only.</small></label>
+        <label>CPU threads <input type="number" name="threads" min="0"><small>0 = automatic.</small></label>
+        <label class="row"><input type="checkbox" name="thinking"> Deep thinking before answers (better analysis, slower)</label>
+        <label>Temperature <input type="number" name="temperature" step="0.05" min="0" max="1.5"></label>
+        <label>Agent steps (max tool calls per question) <input type="number" name="max_agent_steps" min="2" max="20"></label>
+        <details><summary>Advanced: use another OpenAI-compatible model server</summary>
+          <label>Base URL <input name="external_base_url" placeholder="http://localhost:11434/v1"></label>
+          <label>API key <input name="external_api_key" type="password"></label>
+          <label>Model name <input name="external_model"></label>
+          <label>Custom chat GGUF path <input name="chat_model_file"></label>
+          <label>Custom embedding GGUF path <input name="embed_model_file"><small>Changing the embedding model requires re-importing documents.</small></label>
+        </details>
+        <button class="primary" id="savesettings">Save</button>
+        <div id="sysinfo" class="muted mono"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- First-run setup -->
+<div id="setup" class="overlay hidden">
+  <div class="card setupcard">
+    <h2>Welcome to PoliSci RAG</h2>
+    <p>Everything runs privately on this computer. The first time, the app needs to download its AI models (about <b>5.3 GB</b>):</p>
+    <ul id="modellist"></ul>
+    <div class="bar"><div id="dlbar"></div></div>
+    <p id="dlmsg" class="muted"></p>
+    <button class="primary" id="dlgo">Download models</button>
+    <p class="muted small">Downloads resume if interrupted. Files are stored in <span id="datadir" class="mono"></span>.</p>
+  </div>
+</div>
+
+<div id="popover" class="popover hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

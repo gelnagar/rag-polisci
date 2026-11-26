@@ -1,0 +1,117 @@
+name: Build Windows installer
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      # Pin a llama.cpp release here (e.g. b6500) for reproducible builds; empty = latest.
+      LLAMA_TAG: ""
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Unit tests
+        run: python -m pytest -q tests
+
+      - name: Read app version
+        id: ver
+        shell: bash
+        run: echo "version=$(python -c 'import polisci_rag;print(polisci_rag.__version__)')" >> "$GITHUB_OUTPUT"
+
+      - name: Download llama.cpp (Vulkan GPU + CPU builds)
+        shell: pwsh
+        run: |
+          $tag = $env:LLAMA_TAG
+          if (-not $tag) { $tag = gh release view --repo ggml-org/llama.cpp --json tagName -q .tagName }
+          Write-Host "llama.cpp release: $tag"
+          $assets = gh release view $tag --repo ggml-org/llama.cpp --json assets -q '.assets[].name'
+          New-Item -ItemType Directory -Force dl | Out-Null
+          foreach ($kind in @("vulkan", "cpu")) {
+            $name = $assets | Where-Object { $_ -match "bin-win-$kind-x64\.zip$" } | Select-Object -First 1
+            if (-not $name) { throw "No win-$kind-x64 asset in $tag. Assets: $assets" }
+            gh release download $tag --repo ggml-org/llama.cpp --pattern $name --dir dl --clobber
+            $dest = "packaging/llama/$kind"
+            Expand-Archive "dl/$name" -DestinationPath "dl/$kind" -Force
+            $server = Get-ChildItem "dl/$kind" -Recurse -Filter llama-server.exe | Select-Object -First 1
+            if (-not $server) { throw "llama-server.exe missing from $name" }
+            New-Item -ItemType Directory -Force $dest | Out-Null
+            Copy-Item "$($server.DirectoryName)/*" $dest -Recurse -Force
+          }
+          "llama.cpp $tag" | Out-File packaging/llama/VERSION.txt
+          Get-ChildItem packaging/llama -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+
+      - name: Build app with PyInstaller
+        run: pyinstaller packaging/PoliSciRAG.spec --noconfirm
+
+      - name: Bundle llama.cpp into the app
+        shell: pwsh
+        run: Copy-Item packaging/llama dist/PoliSciRAG/llama -Recurse -Force
+
+      - name: Smoke test the packaged app
+        shell: pwsh
+        run: |
+          & dist/PoliSciRAG/llama/cpu/llama-server.exe --version
+          $env:POLISCI_RAG_HOME = "$env:RUNNER_TEMP\psr-home"
+          $p = Start-Process dist/PoliSciRAG/PoliSciRAG.exe -ArgumentList "--headless","--no-browser" -PassThru
+          $ok = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep 2
+            try { $r = Invoke-RestMethod http://127.0.0.1:8765/api/status; $ok = $true; break } catch {}
+          }
+          if (-not $ok) { Get-Content "$env:POLISCI_RAG_HOME\logs\*" -ErrorAction SilentlyContinue; throw "App did not start" }
+          $r | ConvertTo-Json -Depth 5
+          if (-not ($r.runtime.binaries -match "vulkan")) { throw "Vulkan llama-server not found by app" }
+          $html = Invoke-WebRequest http://127.0.0.1:8765/ -UseBasicParsing
+          if ($html.Content -notmatch "PoliSci RAG") { throw "UI not served" }
+          Stop-Process -Id $p.Id -Force
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            $default = "${env:ProgramFiles(x86)}\Inno Setup 6"
+            if (-not (Test-Path "$default\ISCC.exe")) { choco install innosetup -y --no-progress }
+            $env:PATH += ";$default"
+          }
+          iscc /DAppVersion=${{ steps.ver.outputs.version }} packaging/installer.iss
+          Get-ChildItem Output
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PoliSciRAG-Setup-${{ steps.ver.outputs.version }}
+          path: Output/*.exe
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: PoliSci RAG v${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          files: Output/*.exe
+          body: |
+            ## Download & install
+            1. Download **PoliSciRAG-Setup-${{ steps.ver.outputs.version }}.exe** below and run it (no admin rights needed).
+               Windows SmartScreen may warn because the installer is unsigned: click **More info → Run anyway**.
+            2. Launch **PoliSci RAG** from the Start menu / desktop. On first launch, click **Download models** (≈5.3 GB, one time).
+            3. Drop your PDFs into the Library and start asking questions, writing reviews and comparing texts.
+
+            Requirements: Windows 10/11 64-bit, 16 GB RAM recommended (8 GB minimum), ~8 GB free disk. A GPU (NVIDIA/AMD/Intel via Vulkan) is used automatically if present.
