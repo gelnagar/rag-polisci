@@ -26,7 +26,10 @@ def wait(pred, what, timeout=900):
 
 
 def runtime_ready():
-    st = c.get("/api/status").json()
+    try:
+        st = c.get("/api/status").json()
+    except httpx.TransportError:
+        return None  # app still starting
     rt = st["runtime"]
     if rt["status"] == "error":
         raise SystemExit("runtime error: " + str(rt["error"]))

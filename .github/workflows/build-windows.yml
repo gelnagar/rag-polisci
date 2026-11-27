@@ -143,11 +143,14 @@ jobs:
           @{ chat_model_file = "$env:RUNNER_TEMP\chat.gguf"; embed_model_file = "$env:RUNNER_TEMP\embed.gguf" } |
             ConvertTo-Json | Set-Content "$home2\settings.json"
           $env:POLISCI_RAG_HOME = $home2
-          $p = Start-Process "$Dir\python\python.exe" -ArgumentList "`"$Dir\app\launcher.py`"", "--headless", "--no-browser" -WorkingDirectory "$Dir\app" -PassThru
+          $p = Start-Process "$Dir\python\python.exe" -ArgumentList "`"$Dir\app\launcher.py`"", "--headless", "--no-browser" -WorkingDirectory "$Dir\app" -PassThru `
+            -RedirectStandardOutput "$env:RUNNER_TEMP\app-out.txt" -RedirectStandardError "$env:RUNNER_TEMP\app-err.txt"
           try {
             python scripts/e2e_smoke.py http://127.0.0.1:8765
             if ($LASTEXITCODE -ne 0) { throw "e2e failed" }
           } catch {
+            Write-Host "app exited: $($p.HasExited)"
+            Get-Content "$env:RUNNER_TEMP\app-out.txt", "$env:RUNNER_TEMP\app-err.txt" -ErrorAction SilentlyContinue | Select-Object -Last 80
             Get-ChildItem "$home2\logs" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "== $($_.Name)"; Get-Content $_.FullName -Tail 60 }
             throw
           } finally {
