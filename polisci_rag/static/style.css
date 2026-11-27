@@ -89,3 +89,7 @@ button { font: inherit; cursor: pointer; }
 .setupcard { width: min(560px, 92vw); }
 .outrow { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 8px; cursor: pointer; }
 .progress-line { font-size: 13px; color: var(--muted); margin: 8px 0; }
+.updatebar { margin-top: auto; font-size: 12px; padding: 10px; border-radius: 8px; background: var(--chip); }
+.updatebar + .engine { margin-top: 8px; }
+.quit { margin: 6px 10px 0; }
+.scope > label:first-child { border-color: var(--accent); }

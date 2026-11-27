@@ -8,6 +8,7 @@ from typing import Callable
 from . import prompts
 from .config import get_settings
 from .llm import chat, est_tokens
+from .llm_server import effective_context
 from .retrieval import cite, format_hits, search
 from .store import get_store
 
@@ -146,7 +147,7 @@ class ToolBox:
         out = []
         if doc["summary"] and from_section is None:
             out.append("BOOK OVERVIEW\n" + doc["summary"])
-        budget = int(get_settings().context_size * 4 * 0.35)
+        budget = int(effective_context() * 4 * 0.35)
         used = sum(len(x) for x in out)
         for s in secs:
             if a <= s["idx"] <= b:
@@ -188,8 +189,10 @@ def _compact(messages: list[dict], limit_tokens: int) -> None:
 
 
 def run_agent(question: str, history: list[dict], doc_ids: list[int] | None, emit: Emit,
-              cancel: Callable[[], bool]) -> tuple[str, dict]:
+              cancel: Callable[[], bool], use_library: bool = True) -> tuple[str, dict]:
     s = get_settings()
+    if not use_library:
+        return _general_chat(question, history, emit, cancel), {}
     tb = ToolBox()
     system = prompts.AGENT_SYSTEM + "\n\nLibrary:\n" + tb.t_list_documents()
     if doc_ids:
@@ -198,7 +201,7 @@ def run_agent(question: str, history: list[dict], doc_ids: list[int] | None, emi
     for h in history[-6:]:
         messages.append({"role": h["role"], "content": h["content"][:4000]})
     messages.append({"role": "user", "content": question})
-    budget = int(s.context_size * 0.62)
+    budget = int(effective_context() * 0.62)
 
     ready = False
     for step in range(s.max_agent_steps):
@@ -245,10 +248,23 @@ def run_agent(question: str, history: list[dict], doc_ids: list[int] | None, emi
             break
 
     # Final, tool-free answer (with optional deep thinking), streamed to the UI.
-    _compact(messages, int(s.context_size * 0.55))
+    _compact(messages, int(effective_context() * 0.55))
     messages.append({"role": "user", "content": prompts.FINAL_ANSWER})
     emit({"type": "status", "text": "Writing answer…"})
     res = chat(messages, max_tokens=3000, thinking=s.thinking, cancel=cancel,
                on_token=lambda t: emit({"type": "token", "text": t}),
                on_reasoning=lambda t: emit({"type": "reasoning", "text": t}))
     return res.content, tb.citations
+
+
+def _general_chat(question: str, history: list[dict], emit: Emit, cancel: Callable[[], bool]) -> str:
+    """Plain conversation without the library (brainstorming, outlines, concepts)."""
+    messages = [{"role": "system", "content": prompts.GENERAL_SYSTEM}]
+    for h in history[-8:]:
+        messages.append({"role": h["role"], "content": h["content"][:4000]})
+    messages.append({"role": "user", "content": question})
+    emit({"type": "status", "text": "Writing answer…"})
+    res = chat(messages, max_tokens=3000, thinking=get_settings().thinking, cancel=cancel,
+               on_token=lambda t: emit({"type": "token", "text": t}),
+               on_reasoning=lambda t: emit({"type": "reasoning", "text": t}))
+    return res.content

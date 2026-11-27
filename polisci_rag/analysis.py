@@ -8,6 +8,7 @@ from typing import Callable
 from . import prompts
 from .config import get_settings
 from .llm import complete, est_tokens
+from .llm_server import effective_context
 from .retrieval import cite, format_hits, search
 from .store import get_store
 
@@ -22,7 +23,7 @@ def _author(doc: dict) -> str:
 
 def _input_budget_chars() -> int:
     """Characters of source text that fit in one call, leaving room for prompt + output."""
-    ctx = get_settings().context_size
+    ctx = effective_context()
     return max(6000, int((ctx - 3500) * 0.8) * 4)
 
 

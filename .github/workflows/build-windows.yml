@@ -1,4 +1,4 @@
-name: Build Windows installer
+name: Build Windows release
 
 on:
   push:
@@ -13,7 +13,7 @@ jobs:
   build:
     runs-on: windows-latest
     env:
-      # Pin a llama.cpp release here (e.g. b6500) for reproducible builds; empty = latest.
+      # Pin a llama.cpp release here (e.g. b6500) for reproducible builds; empty = newest with Windows builds.
       LLAMA_TAG: ""
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -63,48 +63,115 @@ jobs:
             Copy-Item "$($server.DirectoryName)/*" $dest -Recurse -Force
           }
           "llama.cpp $tag" | Out-File packaging/llama/VERSION.txt
-          Get-ChildItem packaging/llama -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
-
-      - name: Build app with PyInstaller
-        run: pyinstaller packaging/PoliSciRAG.spec --noconfirm
-
-      - name: Bundle llama.cpp into the app
-        shell: pwsh
-        run: Copy-Item packaging/llama dist/PoliSciRAG/llama -Recurse -Force
-
-      - name: Smoke test the packaged app
-        shell: pwsh
-        run: |
-          & dist/PoliSciRAG/llama/cpu/llama-server.exe --version
-          $env:POLISCI_RAG_HOME = "$env:RUNNER_TEMP\psr-home"
-          $p = Start-Process dist/PoliSciRAG/PoliSciRAG.exe -ArgumentList "--headless","--no-browser" -PassThru
-          $ok = $false
-          for ($i = 0; $i -lt 60; $i++) {
-            Start-Sleep 2
-            try { $r = Invoke-RestMethod http://127.0.0.1:8765/api/status; $ok = $true; break } catch {}
+          $help = & packaging/llama/cpu/llama-server.exe --help 2>&1 | Out-String
+          foreach ($flag in @("--embedding", "--jinja", "-np", "-ngl", "-ub")) {
+            if ($help -notmatch [regex]::Escape($flag)) { throw "llama-server no longer supports $flag" }
           }
-          if (-not $ok) { Get-Content "$env:POLISCI_RAG_HOME\logs\*" -ErrorAction SilentlyContinue; throw "App did not start" }
-          $r | ConvertTo-Json -Depth 5
-          if (-not ($r.runtime.binaries -match "vulkan")) { throw "Vulkan llama-server not found by app" }
-          $html = Invoke-WebRequest http://127.0.0.1:8765/ -UseBasicParsing
-          if ($html.Content -notmatch "PoliSci RAG") { throw "UI not served" }
-          Stop-Process -Id $p.Id -Force
 
-      - name: Build installer (Inno Setup)
+      - name: Assemble app on the signed python.org runtime
         shell: pwsh
         run: |
+          $root = "build/PoliSciRAG"
+          New-Item -ItemType Directory -Force "$root/app", dl | Out-Null
+          $pyver = python -c "import platform;print(platform.python_version())"
+          curl.exe -fsSL -o dl/pyembed.zip "https://www.python.org/ftp/python/$pyver/python-$pyver-embed-amd64.zip"
+          Expand-Archive dl/pyembed.zip "$root/python" -Force
+          $sig = Get-AuthenticodeSignature "$root/python/pythonw.exe"
+          Write-Host "pythonw.exe signature: $($sig.Status) $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "pythonw.exe is not validly signed" }
+          $pth = Get-ChildItem "$root/python" -Filter "python3*._pth" | Select-Object -First 1
+          $stdlib = (Get-ChildItem "$root/python" -Filter "python3*.zip" | Select-Object -First 1).Name
+          Set-Content $pth.FullName "$stdlib`r`n.`r`nLib`r`nLib\site-packages`r`n..\app`r`nimport site" -Encoding ascii
+          python -m pip install --only-binary=:all: --target "$root/python/Lib/site-packages" -r requirements.txt
+          # tkinter (for the small control window) is not part of the embeddable runtime: copy it in.
+          $base = python -c "import sys;print(sys.base_prefix)"
+          Copy-Item "$base/Lib/tkinter" "$root/python/Lib/tkinter" -Recurse
+          Get-ChildItem "$base/DLLs" | Where-Object { $_.Name -match '^(_tkinter\.pyd|tcl.*\.dll|tk.*\.dll|zlib.*\.dll)$' } |
+            Copy-Item -Destination "$root/python/"
+          Copy-Item "$base/tcl" "$root/python/tcl" -Recurse
+          # app
+          Copy-Item launcher.py, packaging/app.ico, packaging/uninstall.ps1 "$root/app/"
+          Copy-Item polisci_rag "$root/app/polisci_rag" -Recurse
+          Get-ChildItem $root -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force
+          & "$root/python/python.exe" -c "import polisci_rag, fastapi, uvicorn, pymupdf, numpy, docx, httpx, tkinter; print('imports ok', polisci_rag.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw "embedded runtime import check failed" }
+          & "$root/python/python.exe" -c "import tkinter; r = tkinter.Tk(); r.destroy(); print('tk ok')"
+          if ($LASTEXITCODE -ne 0) { Write-Warning "Tk window test failed on the runner (no desktop?) - app still works without it" }
+
+      - name: Build release zips
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path build/PoliSciRAG/python, build/PoliSciRAG/app -DestinationPath dist/PoliSciRAG-app-win64.zip -CompressionLevel Optimal
+          Compress-Archive -Path packaging/llama/* -DestinationPath dist/PoliSciRAG-engine-win64.zip -CompressionLevel Optimal
+          Copy-Item packaging/install.ps1, packaging/PoliSciRAG-Install.cmd dist/
+          Get-ChildItem dist | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Test repair script on a simulated v0.1.0 install (Windows PowerShell 5.1)
+        shell: pwsh
+        run: |
+          $Dir = Join-Path $env:LOCALAPPDATA 'Programs\PoliSciRAG'
+          New-Item -ItemType Directory -Force "$Dir\_internal" | Out-Null
+          Set-Content "$Dir\PoliSciRAG.exe" 'old build'
+          Copy-Item packaging/llama "$Dir\llama" -Recurse
+          $env:PSRAG_SOURCE_DIR = (Resolve-Path dist).Path
+          $env:PSRAG_NO_LAUNCH = '1'
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging/install.ps1
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 failed (repair)" }
+          if (Test-Path "$Dir\PoliSciRAG.exe") { throw "old exe not removed" }
+          if (-not (Test-Path "$Dir\app\llama\vulkan\llama-server.exe")) { throw "engine not carried over" }
+          $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'PoliSci RAG\PoliSci RAG.lnk'
+          if (-not (Test-Path $lnk)) { throw "start menu shortcut missing" }
+          $t = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath
+          if ($t -notlike '*python\pythonw.exe') { throw "shortcut target wrong: $t" }
+          Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{BBD4F897-DC1F-49B8-B962-884D11654F0D}_is1' | Select-Object DisplayName, DisplayVersion, UninstallString
+          # fresh-install path: no engine present -> engine zip is used
+          Remove-Item "$Dir\app\llama" -Recurse -Force
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging/install.ps1
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 failed (fresh)" }
+          if (-not (Test-Path "$Dir\app\llama\cpu\llama-server.exe")) { throw "engine not installed from zip" }
+          Write-Host "repair + fresh install OK"
+
+      - name: End-to-end test of the installed app with a small model
+        shell: pwsh
+        run: |
+          $Dir = Join-Path $env:LOCALAPPDATA 'Programs\PoliSciRAG'
+          $home2 = Join-Path $env:RUNNER_TEMP 'psr-home'
+          New-Item -ItemType Directory -Force $home2 | Out-Null
+          curl.exe -fsSL -o "$env:RUNNER_TEMP\chat.gguf" https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf
+          curl.exe -fsSL -o "$env:RUNNER_TEMP\embed.gguf" https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.f16.gguf
+          @{ chat_model_file = "$env:RUNNER_TEMP\chat.gguf"; embed_model_file = "$env:RUNNER_TEMP\embed.gguf" } |
+            ConvertTo-Json | Set-Content "$home2\settings.json"
+          $env:POLISCI_RAG_HOME = $home2
+          $p = Start-Process "$Dir\python\python.exe" -ArgumentList "`"$Dir\app\launcher.py`"", "--headless", "--no-browser" -WorkingDirectory "$Dir\app" -PassThru
+          try {
+            python scripts/e2e_smoke.py http://127.0.0.1:8765
+            if ($LASTEXITCODE -ne 0) { throw "e2e failed" }
+          } catch {
+            Get-ChildItem "$home2\logs" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "== $($_.Name)"; Get-Content $_.FullName -Tail 60 }
+            throw
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Get-Process llama-server -ErrorAction SilentlyContinue | Stop-Process -Force
+          }
+
+      - name: Build full offline installer (Inno Setup)
+        shell: pwsh
+        run: |
+          Copy-Item packaging/llama build/PoliSciRAG/app/llama -Recurse -Force
           if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
             $default = "${env:ProgramFiles(x86)}\Inno Setup 6"
             if (-not (Test-Path "$default\ISCC.exe")) { choco install innosetup -y --no-progress }
             $env:PATH += ";$default"
           }
           iscc /DAppVersion=${{ steps.ver.outputs.version }} packaging/installer.iss
-          Get-ChildItem Output
+          Copy-Item Output/*.exe dist/
+          Get-ChildItem dist | Select-Object Name, Length | Format-Table -AutoSize
 
       - uses: actions/upload-artifact@v4
         with:
-          name: PoliSciRAG-Setup-${{ steps.ver.outputs.version }}
-          path: Output/*.exe
+          name: PoliSciRAG-${{ steps.ver.outputs.version }}
+          path: dist/*
 
       - name: Publish GitHub Release
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
@@ -113,12 +180,31 @@ jobs:
           tag_name: v${{ steps.ver.outputs.version }}
           name: PoliSci RAG v${{ steps.ver.outputs.version }}
           target_commitish: ${{ github.sha }}
-          files: Output/*.exe
+          make_latest: true
+          files: dist/*
           body: |
-            ## Download & install
-            1. Download **PoliSciRAG-Setup-${{ steps.ver.outputs.version }}.exe** below and run it (no admin rights needed).
-               Windows SmartScreen may warn because the installer is unsigned: click **More info → Run anyway**.
-            2. Launch **PoliSci RAG** from the Start menu / desktop. On first launch, click **Download models** (≈5.3 GB, one time).
-            3. Drop your PDFs into the Library and start asking questions, writing reviews and comparing texts.
+            ## Install, repair or update (recommended)
+            Press **Win + R**, paste this line, press **Enter**:
+            ```
+            powershell -ExecutionPolicy Bypass -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/gelnagar/rag-polisci/releases/latest/download/install.ps1'))"
+            ```
+            This works for a fresh install **and** fixes/updates an existing one in about a minute. Downloaded models, books and settings are kept. A Start-menu and desktop shortcut **PoliSci RAG** are created and the app opens in your browser.
 
-            Requirements: Windows 10/11 64-bit, 16 GB RAM recommended (8 GB minimum), ~8 GB free disk. A GPU (NVIDIA/AMD/Intel via Vulkan) is used automatically if present.
+            *Alternative:* download **PoliSciRAG-Install.cmd** below and double-click it (if Windows warns, choose **More info → Run anyway**).
+
+            ### Why this fixes the "Windows blocked it" problem
+            v0.1.0 shipped a self-made `.exe` that Windows Defender/SmartScreen often flag as unknown. From v0.2.0 the app runs on the **official, digitally signed Python runtime from python.org** — no self-made executable — and the one-line installer above is not a downloaded file, so SmartScreen does not intercept it.
+
+            ### Other files
+            - `PoliSciRAG-Setup-${{ steps.ver.outputs.version }}.exe` — classic offline setup wizard (unsigned; SmartScreen may warn).
+            - `PoliSciRAG-app-win64.zip`, `PoliSciRAG-engine-win64.zip` — payloads used by the installer script.
+
+            Requirements: Windows 10/11 64-bit, 16 GB RAM recommended (8 GB minimum), ~8 GB free disk. GPUs (NVIDIA/AMD/Intel via Vulkan) are used automatically.
+
+            ### What's new in ${{ steps.ver.outputs.version }}
+            - No more self-made .exe: avoids antivirus false positives; one-click repair/update that keeps your data; in-app **Update now** button.
+            - "Use my library" toggle in chat (off = general political-science tutor chat).
+            - Context window sized automatically to your RAM; automatic GPU memory fitting; engine restarts on the CPU if the GPU driver crashes.
+            - Fixed: with deep thinking on, answers could come back empty.
+            - Security: other websites can no longer send commands to the app running on your computer.
+            - Quit button, disk-space check before the 5.3 GB download, clearer errors, background engine always stops with the app.

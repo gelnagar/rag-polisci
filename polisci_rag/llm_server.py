@@ -41,6 +41,100 @@ def candidate_binaries() -> list[tuple[str, Path]]:
     return out
 
 
+def _kill_on_close_job():
+    """Windows: a job object that kills llama-server if the app crashes or is killed."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        job = k32.CreateJobObjectW(None, None)
+
+        class BASIC(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class IO(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_uint64) for n in ("r", "w", "o", "rt", "wt", "ot")]
+
+        class EXT(ctypes.Structure):
+            _fields_ = [("Basic", BASIC), ("Io", IO), ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        info = EXT()
+        info.Basic.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))
+        return k32, job
+    except Exception:
+        return None
+
+
+_JOB = _kill_on_close_job()
+
+
+def _assign_to_job(proc: subprocess.Popen) -> None:
+    if _JOB:
+        try:
+            k32, job = _JOB
+            k32.AssignProcessToJobObject(job, int(proc._handle))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
+_help_cache: dict[str, str] = {}
+
+
+def binary_help(binary: Path) -> str:
+    key = str(binary)
+    if key not in _help_cache:
+        try:
+            flags = 0x08000000 if sys.platform == "win32" else 0
+            r = subprocess.run([key, "--help"], capture_output=True, text=True, timeout=30,
+                               creationflags=flags, cwd=str(binary.parent))
+            _help_cache[key] = (r.stdout or "") + (r.stderr or "")
+        except Exception:
+            _help_cache[key] = ""
+    return _help_cache[key]
+
+
+def total_ram_gb() -> float:
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            m = MS()
+            m.dwLength = ctypes.sizeof(MS)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+            return m.ullTotalPhys / 2**30
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
+    except Exception:
+        return 16.0
+
+
+def effective_context() -> int:
+    """User setting, or (0 = auto) a size that fits this machine's RAM."""
+    n = get_settings().context_size
+    if n and n > 0:
+        return n
+    ram = total_ram_gb()
+    if ram < 11:
+        return 8192
+    if ram < 24:
+        return 16384
+    return 32768
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -53,6 +147,8 @@ class ServerProc:
         self.proc: subprocess.Popen | None = None
         self.port: int | None = None
         self.backend: str | None = None
+        self.gpu = False
+        self.crashes = 0
         self.error: str | None = None
         self.log_path = LOG_DIR / f"llama-{name}.log"
 
@@ -82,6 +178,7 @@ class ServerProc:
         self.proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
                                      stdin=subprocess.DEVNULL, creationflags=flags,
                                      cwd=str(binary.parent))
+        _assign_to_job(self.proc)
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.proc.poll() is not None:
@@ -97,24 +194,35 @@ class ServerProc:
         return False
 
     def start(self, model: Path, extra_args: list[str], gpu_layers: int,
-              timeout: float = 300) -> None:
+              timeout: float = 300, force_cpu: bool = False) -> None:
         self.stop()
         self.error = None
+        if not model.exists():
+            self.error = f"Model file not found: {model}. Download the models first."
+            raise RuntimeError(self.error)
         bins = candidate_binaries()
         if not bins:
-            self.error = ("llama-server binary not found. Reinstall the app, or set "
+            self.error = ("llama-server binary not found. Run the repair/update script, or set "
                           "LLAMA_SERVER_BIN to a llama.cpp llama-server executable.")
             raise RuntimeError(self.error)
-        attempts: list[tuple[str, Path, int]] = []
+        attempts: list[tuple[str, Path, list[str]]] = []
         for label, b in bins:
-            if gpu_layers == 0 and label in ("vulkan", "cuda"):
+            gpu_build = label in ("vulkan", "cuda")
+            if gpu_build and (gpu_layers == 0 or force_cpu):
                 continue
-            ngl = 0 if label == "cpu" else (999 if gpu_layers < 0 else gpu_layers)
-            attempts.append((label, b, ngl))
-        for label, b, ngl in attempts:
-            args = ["-m", str(model), "-ngl", str(ngl), *extra_args]
-            if self._launch(b, args, timeout):
-                self.backend = f"{label} (gpu layers: {ngl})"
+            if label == "cpu" or force_cpu:
+                gargs = ["-ngl", "0"]
+            elif gpu_layers > 0:
+                gargs = ["-ngl", str(gpu_layers)]
+            elif "--fit" in binary_help(b):
+                gargs = []  # newer llama.cpp sizes GPU offload to the free VRAM automatically
+            else:
+                gargs = ["-ngl", "999"]
+            attempts.append((label, b, gargs))
+        for label, b, gargs in attempts:
+            if self._launch(b, ["-m", str(model), *gargs, *extra_args], timeout):
+                self.backend = f"{label} ({' '.join(gargs) or 'auto GPU offload'})"
+                self.gpu = label != "cpu" and gargs != ["-ngl", "0"]
                 return
         tail = ""
         try:
@@ -142,9 +250,17 @@ class LLMRuntime:
             return s.external_base_url.rstrip("/").removesuffix("/v1")
         return self.chat.base_url
 
+    def _check_crash(self, sp: ServerProc) -> None:
+        """A server that was running but died (often a GPU driver/VRAM problem) -> CPU next time."""
+        if sp.proc is not None and sp.proc.poll() is not None:
+            sp.crashes += 1
+            sp.proc = None
+
     def ensure_started(self) -> None:
         with self.lock:
             s = get_settings()
+            for sp in (self.chat, self.embed):
+                self._check_crash(sp)
             need_chat = not s.external_base_url and not self.chat.alive()
             need_embed = not self.embed.alive()
             if not (need_chat or need_embed):
@@ -155,12 +271,14 @@ class LLMRuntime:
                 if need_embed:
                     self.embed.start(model_path(EMBED_MODEL),
                                      ["--embedding", "-c", "2048", "-b", "2048", "-ub", "2048",
-                                      "-np", "1"], s.gpu_layers, timeout=180)
+                                      "-np", "1"], s.gpu_layers, timeout=180,
+                                     force_cpu=self.embed.crashes > 0)
                 if need_chat:
-                    args = ["-c", str(s.context_size), "-np", "1", "--jinja"]
+                    args = ["-c", str(effective_context()), "-np", "1", "--jinja"]
                     if s.threads:
                         args += ["-t", str(s.threads)]
-                    self.chat.start(model_path(CHAT_MODEL), args, s.gpu_layers, timeout=600)
+                    self.chat.start(model_path(CHAT_MODEL), args, s.gpu_layers, timeout=600,
+                                    force_cpu=self.chat.crashes > 0)
                 self.status = "ready"
                 self.error = None
             except Exception as e:
@@ -186,6 +304,8 @@ class LLMRuntime:
             else self.chat.backend,
             "embed_backend": self.embed.backend,
             "binaries": [f"{l}: {p}" for l, p in candidate_binaries()],
+            "context": effective_context(),
+            "ram_gb": round(total_ram_gb(), 1),
         }
 
 

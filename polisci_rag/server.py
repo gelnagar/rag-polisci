@@ -4,16 +4,18 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import threading
+import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, analysis, export, jobs, models
+from . import __version__, analysis, export, jobs, models, updates
 from .agent import run_agent
 from .config import DATA_ROOT, PDF_DIR, get_settings, resource_dir, update_settings
 from .llm_server import runtime
@@ -37,12 +39,31 @@ def start_runtime_async() -> None:
 async def lifespan(_app):
     get_store()
     start_runtime_async()
+    updates.check_async()
     yield
     runtime.shutdown()
 
 
 app = FastAPI(title="PoliSci RAG", version=__version__, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
+
+ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
+
+
+@app.middleware("http")
+async def local_only(request: Request, call_next):
+    """Block DNS-rebinding and cross-site requests from other web pages.
+
+    Only pages served by this app may call the API: the Host must be localhost and every
+    state-changing request must carry the X-PSR header (other sites cannot add it without
+    a CORS preflight, which this server never grants)."""
+    host = (request.headers.get("host") or "").rsplit(":", 1)[0].strip("[]")
+    if host not in ALLOWED_HOSTS:
+        return JSONResponse({"detail": "Forbidden host"}, status_code=403)
+    if request.url.path.startswith("/api/") and request.method not in ("GET", "HEAD", "OPTIONS") \
+            and request.headers.get("x-psr") != "1":
+        return JSONResponse({"detail": "Missing X-PSR header"}, status_code=403)
+    return await call_next(request)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -53,12 +74,33 @@ def index():
 # ------------------------------------------------------------------ status / setup
 @app.get("/api/status")
 def status():
+    free = shutil.disk_usage(DATA_ROOT).free
     return {"version": __version__, "data_dir": str(DATA_ROOT), "models": models.downloader.status(),
-            "runtime": runtime.info()}
+            "runtime": runtime.info(), "disk_free": free, "update": updates.status()}
+
+
+@app.post("/api/update")
+def run_update():
+    updates.launch_updater()
+    return {"ok": True}
+
+
+@app.post("/api/shutdown")
+def shutdown():
+    def bye():
+        time.sleep(0.5)
+        runtime.shutdown()
+        os._exit(0)
+    threading.Thread(target=bye, daemon=True).start()
+    return {"ok": True}
 
 
 @app.post("/api/models/download")
 def download_models():
+    need = sum(m.size for m in models.ALL_MODELS if not models.is_ready(m)) + 500_000_000
+    if shutil.disk_usage(DATA_ROOT).free < need:
+        raise HTTPException(400, f"Not enough free disk space: about {need / 1e9:.1f} GB is needed "
+                                 f"on the drive holding {DATA_ROOT}.")
     models.downloader.start()
     return models.downloader.status()
 
@@ -108,6 +150,8 @@ def list_documents():
 
 
 def _queue_ingest(path: Path, title: str | None = None) -> jobs.Job:
+    if not models.all_ready() and not get_settings().external_base_url:
+        raise HTTPException(400, "Download the AI models first (see the setup screen).")
     def work(job: jobs.Job):
         doc_id = ingest_pdf(path, job.set_progress, job.cancelled, title=title)
         return {"doc_id": doc_id}
@@ -223,13 +267,15 @@ async def chat_api(req: Request):
     chat_id = body.get("chat_id") or st.new_chat(msg)
     history = [{"role": m["role"], "content": m["content"]} for m in st.messages(chat_id)]
     doc_ids = [int(i) for i in body.get("doc_ids") or []]
+    use_library = bool(body.get("use_library", True))
     st.add_message(chat_id, "user", msg)
     q: queue.Queue = queue.Queue()
     stop = threading.Event()
 
     def worker():
         try:
-            answer, cites = run_agent(msg, history, doc_ids or None, q.put, stop.is_set)
+            answer, cites = run_agent(msg, history, doc_ids or None, q.put, stop.is_set,
+                                      use_library=use_library)
             st.add_message(chat_id, "assistant", answer, {"citations": cites})
             q.put({"type": "done", "content": answer, "citations": cites, "chat_id": chat_id})
         except Exception as e:

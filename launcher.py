@@ -11,8 +11,25 @@ import threading
 import time
 import webbrowser
 
-PORT = int(os.environ.get("POLISCI_RAG_PORT", "8765"))
+import socket
+
+BASE_PORT = int(os.environ.get("POLISCI_RAG_PORT", "8765"))
+PORT = BASE_PORT
 URL = f"http://127.0.0.1:{PORT}/"
+
+
+def _set_port(p: int) -> None:
+    global PORT, URL
+    PORT, URL = p, f"http://127.0.0.1:{p}/"
+
+
+def _port_free(p: int) -> bool:
+    with socket.socket() as s:
+        try:
+            s.bind(("127.0.0.1", p))
+            return True
+        except OSError:
+            return False
 
 
 def _fix_streams() -> None:
@@ -27,9 +44,24 @@ def _fix_streams() -> None:
 def _already_running() -> bool:
     import httpx
     try:
-        return httpx.get(URL + "api/status", timeout=1.5).status_code == 200
+        r = httpx.get(URL + "api/status", timeout=1.5)
+        return r.status_code == 200 and "version" in r.json()
     except Exception:
         return False
+
+
+def _pick_port() -> bool:
+    """Return True if our app is already running (on one of our ports); else pick a free port."""
+    for p in range(BASE_PORT, BASE_PORT + 10):
+        _set_port(p)
+        if _already_running():
+            return True
+    for p in range(BASE_PORT, BASE_PORT + 10):
+        if _port_free(p):
+            _set_port(p)
+            return False
+    _set_port(BASE_PORT)
+    return False
 
 
 def _serve() -> None:
@@ -40,9 +72,10 @@ def _serve() -> None:
 
 def main() -> None:
     _fix_streams()
-    if _already_running():
+    if _pick_port():
         webbrowser.open(URL)
         return
+    os.environ["POLISCI_RAG_PORT"] = str(PORT)
     t = threading.Thread(target=_serve, daemon=True)
     t.start()
     for _ in range(100):

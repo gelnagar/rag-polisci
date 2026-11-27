@@ -51,13 +51,13 @@ for _d in (DATA_ROOT, MODELS_DIR, PDF_DIR, EXPORT_DIR, LOG_DIR):
 
 @dataclass
 class Settings:
-    # Context window for the chat model. 16k is a good balance of RAM and capability.
-    context_size: int = 16384
+    # Context window for the chat model. 0 = automatic from installed RAM (8k / 16k / 32k).
+    context_size: int = 0
     # -1 = auto (try GPU, fall back to CPU); 0 = CPU only; N = offload N layers.
     gpu_layers: int = -1
     threads: int = 0  # 0 = let llama.cpp decide
-    # Let the model "think" before the final answer (better analysis, slower).
-    thinking: bool = True
+    # Let the model "think" before the final answer (better analysis, much slower on CPU).
+    thinking: bool = False
     temperature: float = 0.6
     # Retrieval
     chunk_tokens: int = 450

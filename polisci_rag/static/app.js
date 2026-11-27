@@ -3,9 +3,10 @@ const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const state = { docs: [], chatId: null, chatScope: new Set(), sending: false };
 
+const H = { "X-PSR": "1" };  // required by the server for state-changing requests
 async function api(path, opts = {}) {
-  const o = { ...opts };
-  if (o.json !== undefined) { o.method = o.method || "POST"; o.headers = { "Content-Type": "application/json" }; o.body = JSON.stringify(o.json); delete o.json; }
+  const o = { ...opts, headers: { ...H, ...(opts.headers || {}) } };
+  if (o.json !== undefined) { o.method = o.method || "POST"; o.headers["Content-Type"] = "application/json"; o.body = JSON.stringify(o.json); delete o.json; }
   const r = await fetch(path, o);
   if (!r.ok) { let m = r.statusText; try { m = (await r.json()).detail || m; } catch {} throw new Error(m); }
   const ct = r.headers.get("content-type") || "";
@@ -98,12 +99,27 @@ async function pollStatus() {
     } else {
       if (!$("#setup").classList.contains("hidden")) { $("#setup").classList.add("hidden"); api("/api/runtime/start", { method: "POST" }); }
     }
+    const u = s.update || {};
+    $("#updatebar").classList.toggle("hidden", !u.available);
+    if (u.available) $("#updatever").textContent = u.latest;
+    const lowDisk = !m.ready && s.disk_free < 6e9;
+    $("#diskwarn").textContent = lowDisk ? `Only ${fmtBytes(s.disk_free)} free on this drive — about 6 GB is needed.` : "";
     const r = s.runtime;
-    $("#engine").innerHTML = `Engine: <b>${esc(r.status)}</b>${r.chat_backend ? "<br>" + esc(r.chat_backend) : ""}${r.error ? `<br><span class="warn">${esc(r.error.slice(0, 160))}</span>` : ""}`;
+    $("#engine").innerHTML = `v${esc(s.version)} · Engine: <b>${esc(r.status)}</b>${r.chat_backend ? "<br>" + esc(r.chat_backend) : ""}<br>RAM ${r.ram_gb} GB · context ${r.context}${r.ram_gb && r.ram_gb < 7.5 ? `<br><span class="warn">Less than 8 GB RAM: the model may not fit.</span>` : ""}${r.error ? `<br><span class="warn">${esc(r.error.slice(0, 160))}</span>` : ""}`;
     $("#sysinfo").textContent = JSON.stringify(s, null, 2);
   } catch (e) { $("#engine").textContent = "Engine: offline"; }
 }
-$("#dlgo").onclick = () => api("/api/models/download", { method: "POST" }).then(pollStatus);
+$("#dlgo").onclick = () => api("/api/models/download", { method: "POST" }).then(pollStatus).catch(e => alert(e.message));
+$("#updatego").onclick = async () => {
+  if (!confirm("Update now? The app will close, update itself (your books, models and settings are kept) and reopen.")) return;
+  try { await api("/api/update", { method: "POST" }); document.body.innerHTML = "<p style='padding:40px;font:16px system-ui'>Updating… a window shows progress. The app reopens when done.</p>"; }
+  catch (e) { alert(e.message + "\n\nYou can also update by running the install command from the GitHub Releases page."); }
+};
+$("#quitbtn").onclick = async () => {
+  if (!confirm("Quit PoliSci RAG and stop the AI engine?")) return;
+  await api("/api/shutdown", { method: "POST" }).catch(() => {});
+  document.body.innerHTML = "<p style='padding:40px;font:16px system-ui'>PoliSci RAG has stopped. You can close this tab.</p>";
+};
 
 // ---------------------------------------------------------------- jobs
 const jobWatchers = {};
@@ -191,7 +207,8 @@ async function renameDoc(id) {
 async function uploadFiles(files) {
   for (const f of files) {
     if (!f.name.toLowerCase().endsWith(".pdf")) continue;
-    await fetch(`/api/documents/upload?filename=${encodeURIComponent(f.name)}`, { method: "POST", body: f });
+    const r = await fetch(`/api/documents/upload?filename=${encodeURIComponent(f.name)}`, { method: "POST", headers: H, body: f });
+    if (!r.ok) { let m = r.statusText; try { m = (await r.json()).detail; } catch {} alert(`${f.name}: ${m}`); }
   }
   pollJobs();
 }
@@ -221,7 +238,7 @@ function msgHTML(role, content) {
 }
 async function exportAnswer(btn) {
   const raw = btn.closest(".msg").dataset.raw || btn.closest(".msg").innerText;
-  const r = await fetch("/api/export_text", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: "Research answer", content: raw }) });
+  const r = await fetch("/api/export_text", { method: "POST", headers: { ...H, "Content-Type": "application/json" }, body: JSON.stringify({ title: "Research answer", content: raw }) });
   const blob = await r.blob(); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "Research answer.docx"; a.click();
 }
 const TOOL_LABEL = { search_documents: a => `Searching: “${a.query || ""}”`, read_pages: a => `Reading D${a.document_id} p.${a.start_page}`,
@@ -239,7 +256,8 @@ $("#chatform").onsubmit = async e => {
   $("#messages").appendChild(box);
   let answer = "";
   try {
-    const r = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: text, chat_id: state.chatId, doc_ids: [...state.chatScope] }) });
+    const r = await fetch("/api/chat", { method: "POST", headers: { ...H, "Content-Type": "application/json" }, body: JSON.stringify({ message: text, chat_id: state.chatId, doc_ids: [...state.chatScope], use_library: $("#uselib").checked }) });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
     const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = "";
     while (true) {
       const { value, done } = await reader.read(); if (done) break;

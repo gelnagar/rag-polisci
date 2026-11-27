@@ -43,7 +43,23 @@ def _headers() -> dict:
     return h
 
 
-def chat(messages: list[dict], *, tools: list[dict] | None = None,
+def chat(messages: list[dict], **kw) -> ChatResult:
+    """Chat completion with recovery: restarts a crashed engine once, and if deep thinking
+    used up the whole token budget without an answer, retries without thinking."""
+    try:
+        res = _chat(messages, **kw)
+    except httpx.TransportError:
+        runtime.ensure_started()  # engine died (e.g. GPU driver issue): restart, CPU fallback
+        res = _chat(messages, **kw)
+    if kw.get("tools") is None and not res.content.strip() and res.reasoning and \
+            not (kw.get("cancel") and kw["cancel"]()):
+        res2 = _chat(messages, **{**kw, "thinking": False})
+        res2.reasoning = res.reasoning
+        return res2
+    return res
+
+
+def _chat(messages: list[dict], *, tools: list[dict] | None = None,
          max_tokens: int = 2048, temperature: float | None = None,
          thinking: bool | None = None,
          on_token: Callable[[str], None] | None = None,
@@ -63,6 +79,8 @@ def chat(messages: list[dict], *, tools: list[dict] | None = None,
     else:
         think = s.thinking if thinking is None else thinking
         body["chat_template_kwargs"] = {"enable_thinking": bool(think)}
+        if think:
+            body["max_tokens"] = max_tokens + 4000  # room for the reasoning itself
         body["top_p"] = 0.95 if think else 0.8
         body["top_k"] = 20
     if tools:
